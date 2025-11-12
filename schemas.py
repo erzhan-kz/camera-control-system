@@ -2,24 +2,6 @@ from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
 
-# User schemas
-class UserBase(BaseModel):
-    login: str
-    role: str
-    full_name: Optional[str] = None
-
-class UserCreate(UserBase):
-    password: str
-
-class UserOut(UserBase):
-    id: int
-    is_active: bool
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
-# Camera schemas
 class CameraBase(BaseModel):
     name: str
     ip: str
@@ -33,11 +15,9 @@ class CameraOut(CameraBase):
     id: int
     status: str
     created_at: datetime
-    
     class Config:
         from_attributes = True
 
-# Visitor schemas
 class VisitorBase(BaseModel):
     full_name: str
     camera_id: int
@@ -53,14 +33,9 @@ class VisitorOut(VisitorBase):
     photo: Optional[str] = None
     operator: Optional[str] = None
     created_at: datetime
-    
     class Config:
         from_attributes = True
 
-# Token schemas
 class Token(BaseModel):
     access_token: str
     token_type: str
-
-class TokenData(BaseModel):
-    login: Optional[str] = None
