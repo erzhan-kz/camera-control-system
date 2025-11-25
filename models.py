@@ -1,38 +1,36 @@
-from sqlalchemy import Column, Integer, String, TIMESTAMP, ForeignKey, Boolean
-from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
-from database import Base
+# models.py
+from sqlalchemy import (Column, Integer, String, DateTime, Boolean, Text)
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+import datetime
+import json
+
+Base = declarative_base()
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    login = Column(String, unique=True, index=True)
-    password_hash = Column(String)
-    role = Column(String, default="operator")
-    full_name = Column(String)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, default="user")  # "admin" or "user"
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-class Camera(Base):
-    __tablename__ = "cameras"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String)
-    ip = Column(String)
-    type = Column(String)
-    status = Column(String, default="Активна")
-    location = Column(String)
-    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    visitors = relationship("Visitor", back_populates="camera")
+class Visit(Base):
+    __tablename__ = "visits"
+    id = Column(Integer, primary_key=True)
+    photo_path = Column(String, nullable=False)
+    time_in = Column(DateTime, nullable=False)
+    time_out = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    person_data = Column(Text, nullable=True)  # JSON
+    image_hash = Column(String, nullable=True)
+    exited = Column(Boolean, default=False)
 
-class Visitor(Base):
-    __tablename__ = "visitors"
-    id = Column(Integer, primary_key=True, index=True)
-    full_name = Column(String)
-    entry_time = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    exit_time = Column(TIMESTAMP(timezone=True), nullable=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"))
-    photo = Column(String)
-    operator = Column(String)
-    notes = Column(String)
-    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    camera = relationship("Camera", back_populates="visitors")
+# DB helper
+def get_engine(db_url="sqlite:///./camera.db"):
+    return create_engine(db_url, connect_args={"check_same_thread": False})
+
+def get_session(engine):
+    SessionLocal = sessionmaker(bind=engine)
+    return SessionLocal()
