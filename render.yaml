@@ -1,20 +1,7 @@
-# Exported for Render Deployment
 services:
   - type: web
     name: camera-control-system
     env: python
-    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
     plan: free
-
-    repo: https://github.com/erzhan-kz/camera-control-system
-    branch: main
-    autoDeploy: true
-
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-
-    startCommand: |
-      uvicorn main:app --host 0.0.0.0 --port $PORT
-
-
