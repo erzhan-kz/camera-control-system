@@ -1,170 +1,163 @@
-# main.py
 import os
-import uvicorn
-from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks, Form
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+import sqlite3
+import requests
+from flask import Flask, render_template, request, redirect, session, url_for, flash
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-from models import Base, get_engine, get_session, User, Visit
-from sqlalchemy.orm import Session
-import datetime
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-import uuid
-from camera_ezviz import download_snapshot
-from PIL import Image
-import imagehash
+load_dotenv()  # Загружаем .env с токенами EZVIZ
 
-# CONFIG
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60*24*7
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "supersecretkey")
 
-EZVIZ_DEVICE_SERIAL = os.getenv("EZVIZ_DEVICE_SERIAL")  # e.g. BF8488786
-SNAPSHOT_DIR = os.getenv("SNAPSHOT_DIR", "./media/faces")
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./camera.db")
+# EZVIZ API параметры
+EZVIZ_APP_KEY = os.environ.get("EZVIZ_APP_KEY")
+EZVIZ_APP_SECRET = os.environ.get("EZVIZ_APP_SECRET")
+EZVIZ_ACCESS_TOKEN = os.environ.get("EZVIZ_ACCESS_TOKEN")
+CAMERA_SERIAL = os.environ.get("CAMERA_SERIAL")  # серийный номер камеры
 
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-os.makedirs("static", exist_ok=True)
+# SQLite DB
+DB_PATH = "faces.db"
 
-# DB init
-engine = get_engine(DB_URL)
-Base.metadata.create_all(bind=engine)
-db = get_session(engine)
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        role TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS faces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        photo_url TEXT,
+        checkin_time TEXT,
+        checkout_time TEXT,
+        timer INTEGER DEFAULT 0
+    )""")
+    conn.commit()
+    conn.close()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-app = FastAPI()
-app.mount("/media", StaticFiles(directory="media"), name="media")
-templates = Jinja2Templates(directory="templates")
+init_db()
 
-# Simple auth utils (JWT)
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
+# --- АУТЕНТИФИКАЦИЯ ---
+@app.route("/", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form["username"]
+        password = request.form["password"]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT role FROM users WHERE username=? AND password=?", (username, password))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            session["username"] = username
+            session["role"] = row[0]
+            return redirect(url_for("dashboard"))
+        else:
+            flash("Неверный логин или пароль")
+    return render_template("login.html")
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: datetime.timedelta | None = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+# --- ДАШБОРД ---
+@app.route("/dashboard")
+def dashboard():
+    if "username" not in session:
+        return redirect(url_for("login"))
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM faces")
+    faces = c.fetchall()
+    conn.close()
 
-def get_user_by_username(sess: Session, username: str):
-    return sess.query(User).filter(User.username==username).first()
+    # Подсчёт таймера пребывания
+    updated_faces = []
+    for f in faces:
+        face_id, photo_url, checkin_time, checkout_time, timer = f
+        checkin_dt = datetime.fromisoformat(checkin_time)
+        if checkout_time:
+            checkout_dt = datetime.fromisoformat(checkout_time)
+            stay_time = (checkout_dt - checkin_dt).seconds // 60
+        else:
+            stay_time = (datetime.now() - checkin_dt).seconds // 60
+        updated_faces.append((face_id, photo_url, checkin_time, checkout_time, stay_time))
+    
+    return render_template("dashboard.html", faces=updated_faces, role=session["role"])
 
-# Dependency
-def get_db():
-    session = get_session(engine)
-    try:
-        yield session
-    finally:
-        session.close()
 
-# AUTH endpoints (simple)
-@app.post("/api/register")
-def register_user(username: str = Form(...), password: str = Form(...), role: str = Form("user"), db: Session = Depends(get_db)):
-    if get_user_by_username(db, username):
-        raise HTTPException(400, "User exists")
-    user = User(username=username, password_hash=get_password_hash(password), role=role)
-    db.add(user); db.commit()
-    return {"ok": True, "username": username}
-
-@app.post("/api/login")
-def login(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    user = get_user_by_username(db, username)
-    if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(401, "Invalid credentials")
-    token = create_access_token({"sub": user.username, "role": user.role})
-    return {"access_token": token, "token_type": "bearer", "role": user.role}
-
-# helper: save snapshot from EZVIZ
-def save_snapshot_and_register(device_serial: str = None, session: Session = None):
-    if device_serial is None:
-        device_serial = EZVIZ_DEVICE_SERIAL
-    if device_serial is None:
-        raise RuntimeError("EZVIZ_DEVICE_SERIAL not configured")
-    ts = datetime.datetime.utcnow()
-    filename = f"{ts.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
-    dest = os.path.join(SNAPSHOT_DIR, filename)
-    download_snapshot(device_serial, dest)
-    # compute hash
-    img = Image.open(dest).convert("L").resize((200,200))
-    h = str(imagehash.phash(img))
-    # create Visit record
-    visit = Visit(photo_path=dest, time_in=ts, person_data=None, image_hash=h, exited=False)
-    session.add(visit)
-    session.commit()
-    return visit
-
-# Admin endpoint to trigger snapshot (or background scheduler)
-@app.post("/api/take_snapshot")
-def take_snapshot(background: bool = Form(False), db: Session = Depends(get_db)):
-    if background:
-        # run in background
-        from threading import Thread
-        def job():
-            s = get_session(engine)
+# --- АДМИН: управление пользователями ---
+@app.route("/users", methods=["GET", "POST"])
+def manage_users():
+    if session.get("role") != "Администратор":
+        return redirect(url_for("dashboard"))
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if request.method == "POST":
+        if "add" in request.form:
+            username = request.form["username"]
+            password = request.form["password"]
+            role = request.form["role"]
             try:
-                save_snapshot_and_register(session=s)
-            finally:
-                s.close()
-        t = Thread(target=job, daemon=True); t.start()
-        return {"status":"scheduled"}
+                c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
+                conn.commit()
+                flash("Пользователь добавлен")
+            except:
+                flash("Ошибка добавления пользователя")
+        elif "delete" in request.form:
+            user_id = request.form["delete"]
+            c.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+            flash("Пользователь удалён")
+    c.execute("SELECT id, username, role FROM users")
+    users = c.fetchall()
+    conn.close()
+    return render_template("users.html", users=users)
+
+
+# --- ФИКСАЦИЯ ЛИЦА ЧЕРЕЗ EZVIZ ---
+def get_camera_snapshot():
+    url = f"https://open.ys7.com/api/lapp/device/capture?accessToken={EZVIZ_ACCESS_TOKEN}&deviceSerial={CAMERA_SERIAL}&channelNo=1"
+    try:
+        resp = requests.get(url)
+        data = resp.json()
+        if data["code"] == "200":
+            return data["data"]["picUrl"]
+        else:
+            print("Ошибка EZVIZ:", data)
+            return None
+    except Exception as e:
+        print("Ошибка запроса к EZVIZ:", e)
+        return None
+
+
+@app.route("/capture")
+def capture_face():
+    if "username" not in session:
+        return redirect(url_for("login"))
+    photo_url = get_camera_snapshot()
+    if photo_url:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO faces (photo_url, checkin_time) VALUES (?, ?)", (photo_url, now))
+        conn.commit()
+        conn.close()
+        flash("Лицо зафиксировано")
     else:
-        visit = save_snapshot_and_register(session=db)
-        return {"id": visit.id, "photo": visit.photo_path, "time_in": visit.time_in.isoformat()}
+        flash("Ошибка получения снимка")
+    return redirect(url_for("dashboard"))
 
-# API to mark exit by id
-@app.post("/api/mark_exit/{visit_id}")
-def mark_exit(visit_id: int, db: Session = Depends(get_db)):
-    v = db.query(Visit).get(visit_id)
-    if not v:
-        raise HTTPException(404, "Not found")
-    if v.exited:
-        return {"ok": True, "msg": "Already exited"}
-    v.time_out = datetime.datetime.utcnow()
-    v.duration_seconds = int((v.time_out - v.time_in).total_seconds())
-    v.exited = True
-    db.add(v); db.commit()
-    return {"ok": True}
 
-# API list visits
-@app.get("/api/visits")
-def list_visits(db: Session = Depends(get_db)):
-    rows = db.query(Visit).order_by(Visit.time_in.desc()).all()
-    result = []
-    for r in rows:
-        result.append({
-            "id": r.id,
-            "photo": r.photo_path,
-            "time_in": r.time_in.isoformat(),
-            "time_out": r.time_out.isoformat() if r.time_out else None,
-            "duration_seconds": r.duration_seconds,
-            "person_data": r.person_data,
-            "exited": bool(r.exited)
-        })
-    return result
+# --- ВЫХОД ИЗ СЕССИИ ---
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
-# Simple web UI
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request, db: Session = Depends(get_db)):
-    visits = db.query(Visit).order_by(Visit.time_in.desc()).all()
-    return templates.TemplateResponse("index.html", {"request": request, "visits": visits})
-
-# static helper to serve photo (if needed)
-@app.get("/photo/{filename}")
-def photo(filename: str):
-    path = os.path.join(SNAPSHOT_DIR, filename)
-    if not os.path.exists(path):
-        raise HTTPException(404)
-    return FileResponse(path, media_type="image/jpeg")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
