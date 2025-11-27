@@ -1,13 +1,5 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-sqlalchemy==2.0.23
-pydantic==2.5.0
-python-dotenv==1.0.0
+flask==3.0.0
 requests==2.32.0
-opencv-python==4.8.1.78
-Pillow==10.2.0
-imagehash==4.3.1
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-aiofiles==23.2.1
-Jinja2==3.1.2
+beautifulsoup4==4.12.3
+sqlalchemy==2.0.25
+python-dotenv==1.0.1
