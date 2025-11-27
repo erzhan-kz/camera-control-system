@@ -3,5 +3,5 @@ services:
     name: camera-control-system
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python3 main.py  # Используйте python3 вместо python
     plan: free
